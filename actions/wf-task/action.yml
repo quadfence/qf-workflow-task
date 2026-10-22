@@ -62,7 +62,7 @@ inputs:
     required: false
     default: "{}"
   job_status:
-    description: pass ${{ job.status }} in phase finish
+    description: "(phase finish) the calling job's status; the reusable workflow passes job.status here (a composite action cannot read the job context itself)"
     required: false
     default: ""
   reason_code:
