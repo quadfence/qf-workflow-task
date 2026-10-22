@@ -106,6 +106,7 @@ runs:
         IN_PROJECT: ${{ inputs.client_project }}
         IN_DEPLOYER: ${{ inputs.deployer_sa }}
         IN_READONLY: ${{ inputs.read_only }}
+        IN_PHASE: ${{ inputs.phase }}
         IN_DISPATCH_TOKEN: ${{ inputs.dispatch_token }}
       run: |
         set -euo pipefail
@@ -132,12 +133,16 @@ runs:
         if [[ -z "$PROJECT" && "$DEPLOYER" == *"@"*".iam.gserviceaccount.com" ]]; then
           PROJECT="${DEPLOYER#*@}"; PROJECT="${PROJECT%%.iam.gserviceaccount.com}"
         fi
-        [[ -n "$PROJECT" ]] || { echo "::error::client project unknown: pass client_project (repo variable QF_CLIENT_PROJECT) or a deployer_sa"; exit 1; }
-        if [[ -z "$DEPLOYER" && "$IN_READONLY" != "true" ]]; then
+        # `finish` only reports: it never impersonates and may run after a `start` that died early, so neither a
+        # deployer nor a project is required there (the project is only used for the log sink, with a fallback).
+        if [[ "$IN_PHASE" != "finish" ]]; then
+          [[ -n "$PROJECT" ]] || { echo "::error::client project unknown: pass client_project (repo variable QF_CLIENT_PROJECT) or a deployer_sa"; exit 1; }
+        fi
+        if [[ -z "$DEPLOYER" && "$IN_READONLY" != "true" && "$IN_PHASE" != "finish" ]]; then
           echo "::error::deployer_sa is required (node must declare 'deployer:' -> tenants.yaml deployers) or set read_only=true"; exit 1
         fi
         # Guard: the deployer must live in the client project named for this task (no cross-clinic identities).
-        if [[ -n "$DEPLOYER" && "$DEPLOYER" != *"@${PROJECT}.iam.gserviceaccount.com" ]]; then
+        if [[ -n "$DEPLOYER" && -n "$PROJECT" && "$DEPLOYER" != *"@${PROJECT}.iam.gserviceaccount.com" ]]; then
           echo "::error::deployer_sa '$DEPLOYER' is not in client project '$PROJECT'"; exit 1
         fi
         {
@@ -245,8 +250,15 @@ runs:
           DUR=$(( $(date -u +%s) - ${QF_JOB_STARTED_AT:-$(date -u +%s)} ))
         fi
         # Merge precheck outputs + explicit outputs; mark noop when the precheck short-circuited.
-        OUTS=$(jq -cn --argjson a "${QF_PRECHECK_OUTPUTS:-{}}" --argjson b "${OUTPUTS_JSON:-{}}" --arg nd "${ALREADY_DONE:-false}" \
+        # NB: "${VAR:-{}}" is a bash trap (the first `}` ends the expansion -> `{}}`); default explicitly, and
+        # never let a non-JSON value reach --argjson (jq exits 2 and would kill the report).
+        A="${QF_PRECHECK_OUTPUTS:-}"; B="${OUTPUTS_JSON:-}"
+        echo "$A" | jq -e . >/dev/null 2>&1 || A='{}'
+        echo "$B" | jq -e . >/dev/null 2>&1 || B='{}'
+        OUTS=$(jq -cn --argjson a "$A" --argjson b "$B" --arg nd "${ALREADY_DONE:-false}" \
                '$a + $b + (if $nd=="true" then {noop:true} else {} end)')
+        [[ "$RETRYABLE" =~ ^(true|false|null)$ ]] || RETRYABLE=null
+        [[ "${QF_ATTEMPT:-1}" =~ ^[0-9]+$ ]] || QF_ATTEMPT=1
         EVT=$(jq -cn \
           --arg id "evt-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PHASE}" \
           --arg source "github://${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
@@ -265,7 +277,7 @@ runs:
                   + (if $status=="failed" then {reason_code:(if $reason=="" then "unknown" else $reason end), retryable:$retryable} else {} end))}')
         # Structured log (always) -> Cloud Logging logName qf-workflows, attributable by tenant/run/node
         gcloud logging write qf-workflows "$(echo "$EVT" | jq -c '.data + {phase:"'"$PHASE"'", event_type:.type, github_repo:env.GITHUB_REPOSITORY}')" \
-          --payload-type=json --severity=INFO --project="${QF_RUNNER_PROJECT:-$QF_CLIENT_PROJECT}" \
+          --payload-type=json --severity=INFO --project="${QF_RUNNER_PROJECT:-${QF_CLIENT_PROJECT:-}}" \
           --labels="tenant_id=$TENANT,run_id=$QF_RUN_ID,node_id=$QF_NODE_ID,component=runner" >/dev/null 2>&1 || echo "::warning::structured log write failed"
         # Orchestrator event (only when a topic is configured and this is not adhoc)
         if [[ -n "$TOPIC" && "$QF_RUN_ID" != adhoc-* ]]; then

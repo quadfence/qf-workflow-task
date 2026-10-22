@@ -123,3 +123,6 @@ jobs:
           job_status: ${{ job.status }}
           outputs_json: ${{ steps.outs.outputs.json || '{}' }}
           events_topic: ${{ inputs.events_topic }}
+          deployer_sa: ${{ inputs.deployer_sa }}
+          client_project: ${{ inputs.client_project }}
+          read_only: ${{ inputs.read_only }}
