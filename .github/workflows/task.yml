@@ -108,8 +108,8 @@ jobs:
           OUT=$(bash -c '${{ inputs.outputs_command }}' 2>/dev/null || echo '{}')
           echo "json=$(echo "$OUT" | jq -c . 2>/dev/null || echo '{}')" >> "$GITHUB_OUTPUT"
 
-      - name: Finish (always reports the terminal state)
-        if: always() && steps.start.outcome == 'success'
+      - name: Finish (always reports the terminal state, including a failed start such as iam_grant_missing)
+        if: always()
         uses: ./.qf-platform/actions/wf-task
         with:
           phase: finish

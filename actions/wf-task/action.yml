@@ -216,6 +216,11 @@ runs:
         ALREADY_DONE: ${{ steps.precheck.outputs.already_done }}
         IN_REASON: ${{ inputs.reason_code }}
         IN_RETRYABLE: ${{ inputs.retryable }}
+        # If `start` failed before exporting QF_* (e.g. impersonation refused), report with the dispatch inputs.
+        QF_RUN_ID: ${{ env.QF_RUN_ID || inputs.run_id }}
+        QF_NODE_ID: ${{ env.QF_NODE_ID || inputs.node_id }}
+        QF_TASK_KEY: ${{ env.QF_TASK_KEY || inputs.task_key }}
+        QF_ATTEMPT: ${{ env.QF_ATTEMPT || inputs.attempt }}
         # Events/logs are written by the runner GSA (pod identity), never by the client deployer SA.
         CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT: ""
       run: |
