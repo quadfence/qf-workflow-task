@@ -15,4 +15,4 @@ jobs:
 Contains no secrets and grants nothing: identity comes from the caller's own repo variables (WIF provider + runner SA)
 and the hub only accepts events whose tenant, task_key and dispatch_token match a dispatch it made.
 
-Source commit: 76e81e2 · tag v1.0.0
+Source commit: caabbb6 · tag v1.0.1

@@ -224,8 +224,10 @@ runs:
         # Failure classification (finish only). Deterministic refusals from the release step are NOT retryable.
         REASON="${IN_REASON:-${QF_REASON_CODE:-}}"
         RETRYABLE="${IN_RETRYABLE:-${QF_RETRYABLE:-}}"
+        # Explicit retryable wins; else refused_* is never retryable; else null so the hub derives it from its
+        # REASON_CODES table (single source of truth — the action must not override the hub's classification).
         if [[ -z "$RETRYABLE" ]]; then
-          case "$REASON" in refused_plan_drift|refused_iam_scope) RETRYABLE=false;; *) RETRYABLE=true;; esac
+          case "$REASON" in refused_*) RETRYABLE=false;; *) RETRYABLE=null;; esac
         fi
         if [[ "$PHASE" == "start" ]]; then
           TYPE="com.quadfence.wf.node.started"; STATUS="running"; DUR=0
@@ -253,7 +255,8 @@ runs:
             subject:($tenant+"/"+$run+"/"+$node),
             data:({tenant_id:$tenant, run_id:$run, node_id:$node, attempt:$attempt, task_key:$key, dispatch_token:$tok,
                   status:$status, fingerprint:$fp, github_run_id:$ghrun, links:{logs:$url}, duration_s:$dur,
-                  release:$release, outputs:$outs}
+                  release:$release, outputs:$outs,
+                  dispatch:{github_run_id:($ghrun|tonumber? // $ghrun), run_url:$url, links:{logs:$url}}}
                   + (if $status=="failed" then {reason_code:(if $reason=="" then "unknown" else $reason end), retryable:$retryable} else {} end))}')
         # Structured log (always) -> Cloud Logging logName qf-workflows, attributable by tenant/run/node
         gcloud logging write qf-workflows "$(echo "$EVT" | jq -c '.data + {phase:"'"$PHASE"'", event_type:.type, github_repo:env.GITHUB_REPOSITORY}')" \
