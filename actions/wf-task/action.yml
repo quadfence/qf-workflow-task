@@ -1,0 +1,266 @@
+name: "qf wf-task"
+description: >
+  Task-contract wrapper for Quadfence workflows. Phase "start": derives tenant context, obtains GCP
+  credentials by impersonating the tenant's deployer SA (no secrets), runs the optional precheck,
+  and emits a 'node.started' event + structured log. Phase "finish": maps the job result to a
+  terminal event, publishes outputs, and logs duration. Idempotency key = inputs.task_key.
+author: Quadfence platform
+
+inputs:
+  phase:
+    description: start | finish
+    required: true
+  tenant_id:
+    required: true
+  run_id:
+    description: orchestrator run id, or "adhoc" when a human triggered the workflow
+    required: false
+    default: adhoc
+  node_id:
+    required: false
+    default: ""
+  attempt:
+    required: false
+    default: "1"
+  task_key:
+    required: false
+    default: ""
+  dispatch_token:
+    required: false
+    default: ""
+  params_json:
+    required: false
+    default: "{}"
+  release:
+    required: false
+    default: ""
+  client_project:
+    description: client GCP project id (defaults to the runner pod's QF_CLIENT_PROJECT)
+    required: false
+    default: ""
+  deployer_sa:
+    description: >
+      Identity this task impersonates: one of the clinic's EXISTING per-module deployer SAs, chosen by the
+      orchestrator from tenants.yaml -> deployers via the node's `deployer:` key. Required for phase start
+      unless read_only=true. The platform never derives or creates a deployer.
+    required: false
+    default: ""
+  read_only:
+    description: "true for verification/gate nodes that need no client identity (no impersonation performed)"
+    required: false
+    default: "false"
+  precheck:
+    description: 'shell command that prints JSON {"already_done": bool, "outputs": {...}} (phase start)'
+    required: false
+    default: ""
+  fingerprint_params:
+    description: comma-separated param names included in the idempotency fingerprint
+    required: false
+    default: ""
+  outputs_json:
+    description: JSON object of small, non-PHI outputs to publish (phase finish)
+    required: false
+    default: "{}"
+  job_status:
+    description: pass ${{ job.status }} in phase finish
+    required: false
+    default: ""
+  reason_code:
+    description: >
+      (phase finish) machine-readable failure reason. If empty, read from $QF_REASON_CODE (set by the work
+      step, e.g. `echo "QF_REASON_CODE=refused_plan_drift" >> $GITHUB_ENV`). Known codes:
+      refused_plan_drift, refused_iam_scope, refused_release_mismatch (non-retryable); test_failed, window_closed,
+      iam_grant_missing, not_yet (retryable; `not_yet` on a node with `poll:` re-arms the check instead of failing).
+    required: false
+    default: ""
+  retryable:
+    description: "(phase finish) 'true' | 'false'; if empty, derived from $QF_RETRYABLE or from the reason code"
+    required: false
+    default: ""
+  events_topic:
+    description: Pub/Sub topic (projects/<hub>/topics/workflow-events) for orchestrator events
+    required: false
+    default: ""
+
+outputs:
+  already_done:
+    description: "true when the precheck says the work is already converged"
+    value: ${{ steps.precheck.outputs.already_done }}
+  task_key:
+    value: ${{ steps.ctx.outputs.task_key }}
+  deployer_sa:
+    value: ${{ steps.ctx.outputs.deployer_sa }}
+
+runs:
+  using: composite
+  steps:
+    # ------------------------------------------------------------------ context
+    - id: ctx
+      shell: bash
+      env:
+        IN_TENANT: ${{ inputs.tenant_id }}
+        IN_RUN: ${{ inputs.run_id }}
+        IN_NODE: ${{ inputs.node_id }}
+        IN_ATTEMPT: ${{ inputs.attempt }}
+        IN_KEY: ${{ inputs.task_key }}
+        IN_PROJECT: ${{ inputs.client_project }}
+        IN_DEPLOYER: ${{ inputs.deployer_sa }}
+        IN_READONLY: ${{ inputs.read_only }}
+        IN_DISPATCH_TOKEN: ${{ inputs.dispatch_token }}
+      run: |
+        set -euo pipefail
+        # The per-dispatch event token must not appear in job logs (it still shows as a workflow input on the run
+        # page to repo readers — see docs/11 F14; it is single-use and worthless once the task ends).
+        [[ -z "${IN_DISPATCH_TOKEN:-}" ]] || echo "::add-mask::${IN_DISPATCH_TOKEN}"
+        # Runner pods carry QF_* env (set by terraform/modules/runner-tenant). The workflow input wins
+        # only if it matches the pod's tenant: a workflow cannot "borrow" another tenant's identity.
+        POD_TENANT="${QF_TENANT_ID:-}"
+        if [[ -n "$POD_TENANT" && "$POD_TENANT" != "$IN_TENANT" ]]; then
+          echo "::error::tenant mismatch: workflow says '$IN_TENANT' but runner pool is '$POD_TENANT'"; exit 1
+        fi
+        NODE="${IN_NODE:-$(basename "${GITHUB_WORKFLOW_REF%%@*}" .yml)}"
+        if [[ "$IN_RUN" == "adhoc" || -z "$IN_RUN" ]]; then
+          RUN_ID="adhoc-${GITHUB_RUN_ID}"; KEY="adhoc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        else
+          RUN_ID="$IN_RUN"
+          KEY="${IN_KEY:-$(printf '%s|%s|%s' "$RUN_ID" "$NODE" "$IN_ATTEMPT" | sha256sum | cut -c1-32)}"
+        fi
+        DEPLOYER="${IN_DEPLOYER}"
+        # Client project: explicit input (repo variable QF_CLIENT_PROJECT) > runner env (self-hosted pods) > derived
+        # from the deployer SA's project (GitHub-hosted runners: the SA is always in the clinic project).
+        PROJECT="${IN_PROJECT:-${QF_CLIENT_PROJECT:-}}"
+        if [[ -z "$PROJECT" && "$DEPLOYER" == *"@"*".iam.gserviceaccount.com" ]]; then
+          PROJECT="${DEPLOYER#*@}"; PROJECT="${PROJECT%%.iam.gserviceaccount.com}"
+        fi
+        [[ -n "$PROJECT" ]] || { echo "::error::client project unknown: pass client_project (repo variable QF_CLIENT_PROJECT) or a deployer_sa"; exit 1; }
+        if [[ -z "$DEPLOYER" && "$IN_READONLY" != "true" ]]; then
+          echo "::error::deployer_sa is required (node must declare 'deployer:' -> tenants.yaml deployers) or set read_only=true"; exit 1
+        fi
+        # Guard: the deployer must live in the client project named for this task (no cross-clinic identities).
+        if [[ -n "$DEPLOYER" && "$DEPLOYER" != *"@${PROJECT}.iam.gserviceaccount.com" ]]; then
+          echo "::error::deployer_sa '$DEPLOYER' is not in client project '$PROJECT'"; exit 1
+        fi
+        {
+          echo "run_id=$RUN_ID"; echo "node_id=$NODE"; echo "task_key=$KEY"
+          echo "client_project=$PROJECT"; echo "deployer_sa=$DEPLOYER"
+        } >> "$GITHUB_OUTPUT"
+        # Export for all later steps in the job
+        {
+          echo "QF_TENANT_ID=$IN_TENANT"; echo "QF_RUN_ID=$RUN_ID"; echo "QF_NODE_ID=$NODE"; echo "QF_TASK_KEY=$KEY"; echo "QF_ATTEMPT=$IN_ATTEMPT"
+          echo "QF_CLIENT_PROJECT=$PROJECT"; echo "QF_DEPLOYER_SA=$DEPLOYER"; echo "QF_RELEASE=${{ inputs.release }}"
+          echo "CLOUDSDK_CORE_PROJECT=$PROJECT"
+        } >> "$GITHUB_ENV"
+
+    # ------------------------------------------------------------------ credentials (start only)
+    - id: auth
+      if: inputs.phase == 'start' && inputs.read_only != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Pod identity (Workload Identity, via the GKE metadata server) -> impersonate the tenant
+        # deployer SA. No key files, no GitHub secrets. Verify impersonation works before doing anything.
+        TOKEN=$(gcloud auth print-access-token --impersonate-service-account="$QF_DEPLOYER_SA" 2>/dev/null || true)
+        [[ -n "$TOKEN" ]] || { echo "::error::impersonation of $QF_DEPLOYER_SA failed (TokenCreator grant missing? see terraform/envs/tenant)"; echo "QF_REASON_CODE=iam_grant_missing" >> "$GITHUB_ENV"; exit 1; }
+        echo "::add-mask::$TOKEN"; unset TOKEN
+        # Subsequent steps: gcloud/bq/gsutil impersonate via env; Terraform + Google client libraries via
+        # GOOGLE_IMPERSONATE_SERVICE_ACCOUNT on top of ADC (pod identity). Tokens are minted per call,
+        # so long Terraform applies never hit a 1h token expiry.
+        echo "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=$QF_DEPLOYER_SA" >> "$GITHUB_ENV"
+        echo "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=$QF_DEPLOYER_SA" >> "$GITHUB_ENV"
+        echo "GOOGLE_PROJECT=$QF_CLIENT_PROJECT" >> "$GITHUB_ENV"
+        echo "TF_VAR_project_id=$QF_CLIENT_PROJECT" >> "$GITHUB_ENV"
+        echo "TF_VAR_tenant_id=${{ inputs.tenant_id }}" >> "$GITHUB_ENV"
+        echo "QF_JOB_STARTED_AT=$(date -u +%s)" >> "$GITHUB_ENV"
+        echo "Authenticated as $QF_DEPLOYER_SA for project $QF_CLIENT_PROJECT"
+
+    # ------------------------------------------------------------------ precheck (start only)
+    - id: precheck
+      if: inputs.phase == 'start'
+      shell: bash
+      env:
+        PRECHECK: ${{ inputs.precheck }}
+        PARAMS_JSON: ${{ inputs.params_json }}
+        FP_PARAMS: ${{ inputs.fingerprint_params }}
+      run: |
+        set -euo pipefail
+        # Fingerprint = hash of the params that define "the same work". Published with outputs so the
+        # orchestrator can skip re-dispatch on resume when nothing relevant changed.
+        FP=$(python3 - <<'PY'
+        import json, os, hashlib
+        p = json.loads(os.environ.get("PARAMS_JSON") or "{}")
+        keys = [k for k in os.environ.get("FP_PARAMS","").split(",") if k]
+        sub = {k: p.get(k) for k in keys} if keys else p
+        sub["_release"] = os.environ.get("QF_RELEASE","")
+        print(hashlib.sha256(json.dumps(sub, sort_keys=True).encode()).hexdigest()[:16])
+        PY
+        )
+        echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"; echo "QF_FINGERPRINT=$FP" >> "$GITHUB_ENV"
+        if [[ -z "$PRECHECK" ]]; then echo "already_done=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+        OUT=$(bash -c "$PRECHECK" || true)
+        DONE=$(echo "$OUT" | jq -r '.already_done // false' 2>/dev/null || echo false)
+        echo "already_done=$DONE" >> "$GITHUB_OUTPUT"
+        echo "QF_PRECHECK_OUTPUTS=$(echo "$OUT" | jq -c '.outputs // {}' 2>/dev/null || echo '{}')" >> "$GITHUB_ENV"
+        [[ "$DONE" == "true" ]] && echo "::notice::precheck says work already converged; steps guarded by already_done will be skipped"
+        true
+
+    # ------------------------------------------------------------------ event + log
+    - id: emit
+      shell: bash
+      env:
+        PHASE: ${{ inputs.phase }}
+        JOB_STATUS: ${{ inputs.job_status }}
+        OUTPUTS_JSON: ${{ inputs.outputs_json }}
+        TOPIC: ${{ inputs.events_topic }}
+        TENANT: ${{ inputs.tenant_id }}
+        DISPATCH_TOKEN: ${{ inputs.dispatch_token }}
+        ALREADY_DONE: ${{ steps.precheck.outputs.already_done }}
+        IN_REASON: ${{ inputs.reason_code }}
+        IN_RETRYABLE: ${{ inputs.retryable }}
+        # Events/logs are written by the runner GSA (pod identity), never by the client deployer SA.
+        CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT: ""
+      run: |
+        set -euo pipefail
+        NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        # Failure classification (finish only). Deterministic refusals from the release step are NOT retryable.
+        REASON="${IN_REASON:-${QF_REASON_CODE:-}}"
+        RETRYABLE="${IN_RETRYABLE:-${QF_RETRYABLE:-}}"
+        if [[ -z "$RETRYABLE" ]]; then
+          case "$REASON" in refused_plan_drift|refused_iam_scope) RETRYABLE=false;; *) RETRYABLE=true;; esac
+        fi
+        if [[ "$PHASE" == "start" ]]; then
+          TYPE="com.quadfence.wf.node.started"; STATUS="running"; DUR=0
+        else
+          case "$JOB_STATUS" in
+            success)   TYPE="com.quadfence.wf.node.succeeded"; STATUS="succeeded";;
+            cancelled) TYPE="com.quadfence.wf.node.cancelled"; STATUS="cancelled";;
+            *)         TYPE="com.quadfence.wf.node.failed";    STATUS="failed";;
+          esac
+          DUR=$(( $(date -u +%s) - ${QF_JOB_STARTED_AT:-$(date -u +%s)} ))
+        fi
+        # Merge precheck outputs + explicit outputs; mark noop when the precheck short-circuited.
+        OUTS=$(jq -cn --argjson a "${QF_PRECHECK_OUTPUTS:-{}}" --argjson b "${OUTPUTS_JSON:-{}}" --arg nd "${ALREADY_DONE:-false}" \
+               '$a + $b + (if $nd=="true" then {noop:true} else {} end)')
+        EVT=$(jq -cn \
+          --arg id "evt-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PHASE}" \
+          --arg source "github://${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+          --arg type "$TYPE" --arg time "$NOW" \
+          --arg tenant "$TENANT" --arg run "$QF_RUN_ID" --arg node "$QF_NODE_ID" --argjson attempt "${QF_ATTEMPT:-1}" \
+          --arg key "$QF_TASK_KEY" --arg tok "$DISPATCH_TOKEN" --arg status "$STATUS" --arg fp "${QF_FINGERPRINT:-}" \
+          --arg url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --argjson dur "$DUR" \
+          --arg ghrun "$GITHUB_RUN_ID" --arg release "${QF_RELEASE:-}" --argjson outs "$OUTS" \
+          --arg reason "$REASON" --argjson retryable "$RETRYABLE" \
+          '{specversion:"1.0", id:$id, source:$source, type:$type, time:$time,
+            subject:($tenant+"/"+$run+"/"+$node),
+            data:({tenant_id:$tenant, run_id:$run, node_id:$node, attempt:$attempt, task_key:$key, dispatch_token:$tok,
+                  status:$status, fingerprint:$fp, github_run_id:$ghrun, links:{logs:$url}, duration_s:$dur,
+                  release:$release, outputs:$outs}
+                  + (if $status=="failed" then {reason_code:(if $reason=="" then "unknown" else $reason end), retryable:$retryable} else {} end))}')
+        # Structured log (always) -> Cloud Logging logName qf-workflows, attributable by tenant/run/node
+        gcloud logging write qf-workflows "$(echo "$EVT" | jq -c '.data + {phase:"'"$PHASE"'", event_type:.type, github_repo:env.GITHUB_REPOSITORY}')" \
+          --payload-type=json --severity=INFO --project="${QF_RUNNER_PROJECT:-$QF_CLIENT_PROJECT}" \
+          --labels="tenant_id=$TENANT,run_id=$QF_RUN_ID,node_id=$QF_NODE_ID,component=runner" >/dev/null 2>&1 || echo "::warning::structured log write failed"
+        # Orchestrator event (only when a topic is configured and this is not adhoc)
+        if [[ -n "$TOPIC" && "$QF_RUN_ID" != adhoc-* ]]; then
+          gcloud pubsub topics publish "$TOPIC" --message="$EVT" --ordering-key="$QF_RUN_ID"  >/dev/null && echo "event $TYPE published" || echo "::warning::event publish failed (orchestrator will reconcile via GitHub API)"
+        fi
+        echo "$EVT" | jq . >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true

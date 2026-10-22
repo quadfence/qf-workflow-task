@@ -1,0 +1,125 @@
+# Reusable task wrapper (workflow_call). Client-repo workflows call this so they inherit the task
+# contract (inputs, run-name, concurrency, tenant runner pool, impersonation, precheck, events)
+# without copying it. See docs/03-tenant-onboarding.md for how a client repo uses it.
+#
+# NOTE: `run-name` and `concurrency` must be declared by the CALLER (GitHub evaluates them on the
+# caller workflow). The caller template in this repo does that; CI lint enforces it.
+
+name: _reusable-task
+
+on:
+  workflow_call:
+    inputs:
+      tenant_id:       { type: string, required: true }
+      run_id:          { type: string, required: false, default: adhoc }
+      node_id:         { type: string, required: false, default: "" }
+      attempt:         { type: string, required: false, default: "1" }
+      task_key:        { type: string, required: false, default: "" }
+      dispatch_token:  { type: string, required: false, default: "" }
+      params_json:     { type: string, required: false, default: "{}" }
+      release:         { type: string, required: false, default: "" }
+      runner:          { type: string, required: false, default: "ubuntu-latest" }
+      deployer_sa:     { type: string, required: false, default: "" }      # orchestrator resolves node.deployer -> tenants.yaml deployers
+      client_project:  { type: string, required: false, default: "" }      # clinic GCP project; repo variable QF_CLIENT_PROJECT (derived from deployer_sa if empty)
+      read_only:       { type: boolean, required: false, default: false }  # verification nodes: no impersonation  # orchestrator passes tenants.yaml runner_label (e.g. qf-<tenant> once a self-hosted pool exists)
+      working_directory: { type: string, required: false, default: "." }
+      precheck:        { type: string, required: false, default: "" }      # prints {"already_done":bool,"outputs":{}}
+      fingerprint_params: { type: string, required: false, default: "" }
+      command:         { type: string, required: true }                    # the actual work (converge-style). On a deterministic refusal set
+                                                                            # QF_REASON_CODE (refused_plan_drift|refused_iam_scope) in $GITHUB_ENV and exit 1.
+      outputs_command: { type: string, required: false, default: "echo '{}'" }  # prints JSON outputs after work
+      timeout_minutes: { type: number, required: false, default: 45 }
+      events_topic:    { type: string, required: false, default: "" }      # projects/<hub>/topics/workflow-events
+      # GitHub-HOSTED runners only: keyless auth via Workload Identity Federation (GitHub OIDC -> GSA).
+      # On a Quadfence self-hosted pool leave empty: the pod identity is used and these are ignored.
+      workload_identity_provider: { type: string, required: false, default: "" }  # projects/N/locations/global/workloadIdentityPools/github/providers/github
+      wif_service_account:        { type: string, required: false, default: "" }  # runner GSA allowed to impersonate the tenant's deployer
+    outputs:
+      already_done:
+        value: ${{ jobs.task.outputs.already_done }}
+
+permissions:
+  contents: read
+  id-token: write   # needed only for the WIF path on GitHub-hosted runners
+
+jobs:
+  task:
+    name: ${{ inputs.tenant_id }} / ${{ inputs.node_id || github.workflow }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    outputs:
+      already_done: ${{ steps.start.outputs.already_done }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release != '' && inputs.release || github.ref }}
+
+      # Pull the composite action from the platform repo at a pinned tag.
+      - uses: actions/checkout@v4
+        with:
+          repository: quadfence/qf-workflow-task
+          ref: v1
+          path: .qf-platform
+          sparse-checkout: actions/wf-task
+
+      # GitHub-hosted runner path: obtain ADC through WIF. Self-hosted pods skip this (pod identity).
+      - if: inputs.workload_identity_provider != ''
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.wif_service_account }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - id: start
+        uses: ./.qf-platform/actions/wf-task
+        with:
+          phase: start
+          tenant_id: ${{ inputs.tenant_id }}
+          run_id: ${{ inputs.run_id }}
+          node_id: ${{ inputs.node_id }}
+          attempt: ${{ inputs.attempt }}
+          task_key: ${{ inputs.task_key }}
+          dispatch_token: ${{ inputs.dispatch_token }}
+          params_json: ${{ inputs.params_json }}
+          release: ${{ inputs.release }}
+          precheck: ${{ inputs.precheck }}
+          fingerprint_params: ${{ inputs.fingerprint_params }}
+          events_topic: ${{ inputs.events_topic }}
+          deployer_sa: ${{ inputs.deployer_sa }}
+          client_project: ${{ inputs.client_project }}
+          read_only: ${{ inputs.read_only }}
+
+      - name: Do the work (skipped when precheck says already converged)
+        if: steps.start.outputs.already_done != 'true'
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          QF_PARAMS_JSON: ${{ inputs.params_json }}
+        run: ${{ inputs.command }}
+
+      - id: outs
+        name: Collect outputs
+        if: always() && steps.start.outcome == 'success'
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          QF_PARAMS_JSON: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          OUT=$(bash -c '${{ inputs.outputs_command }}' 2>/dev/null || echo '{}')
+          echo "json=$(echo "$OUT" | jq -c . 2>/dev/null || echo '{}')" >> "$GITHUB_OUTPUT"
+
+      - name: Finish (always reports the terminal state)
+        if: always() && steps.start.outcome == 'success'
+        uses: ./.qf-platform/actions/wf-task
+        with:
+          phase: finish
+          tenant_id: ${{ inputs.tenant_id }}
+          run_id: ${{ inputs.run_id }}
+          node_id: ${{ inputs.node_id }}
+          attempt: ${{ inputs.attempt }}
+          task_key: ${{ inputs.task_key }}
+          dispatch_token: ${{ inputs.dispatch_token }}
+          release: ${{ inputs.release }}
+          job_status: ${{ job.status }}
+          outputs_json: ${{ steps.outs.outputs.json || '{}' }}
+          events_topic: ${{ inputs.events_topic }}
