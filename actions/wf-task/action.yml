@@ -275,12 +275,24 @@ runs:
                   release:$release, outputs:$outs,
                   dispatch:{github_run_id:($ghrun|tonumber? // $ghrun), run_url:$url, links:{logs:$url}}}
                   + (if $status=="failed" then {reason_code:(if $reason=="" then "unknown" else $reason end), retryable:$retryable} else {} end))}')
+        # Both the log sink and the topic live in the HUB project (the runner identity wf-<tenant> has logWriter and
+        # pubsub.publisher there, and nothing in the clinic project). Derive the hub from the topic name; fall back
+        # to QF_RUNNER_PROJECT (self-hosted pods) and finally the client project (adhoc runs without a topic).
+        HUB_PROJECT=""; [[ "$TOPIC" =~ ^projects/([^/]+)/topics/ ]] && HUB_PROJECT="${BASH_REMATCH[1]}"
+        LOG_PROJECT="${HUB_PROJECT:-${QF_RUNNER_PROJECT:-${QF_CLIENT_PROJECT:-}}}"
         # Structured log (always) -> Cloud Logging logName qf-workflows, attributable by tenant/run/node
-        gcloud logging write qf-workflows "$(echo "$EVT" | jq -c '.data + {phase:"'"$PHASE"'", event_type:.type, github_repo:env.GITHUB_REPOSITORY}')" \
-          --payload-type=json --severity=INFO --project="${QF_RUNNER_PROJECT:-${QF_CLIENT_PROJECT:-}}" \
-          --labels="tenant_id=$TENANT,run_id=$QF_RUN_ID,node_id=$QF_NODE_ID,component=runner" >/dev/null 2>&1 || echo "::warning::structured log write failed"
-        # Orchestrator event (only when a topic is configured and this is not adhoc)
+        if ! ERR=$(gcloud logging write qf-workflows "$(echo "$EVT" | jq -c '.data + {phase:"'"$PHASE"'", event_type:.type, github_repo:env.GITHUB_REPOSITORY}')" \
+               --payload-type=json --severity=INFO --project="$LOG_PROJECT" \
+               --labels="tenant_id=$TENANT,run_id=$QF_RUN_ID,node_id=$QF_NODE_ID,component=runner" 2>&1 >/dev/null); then
+          echo "::warning::structured log write to $LOG_PROJECT failed: ${ERR:0:300}"
+        fi
+        # Orchestrator event (only when a topic is configured and this is not adhoc). No ordering key: the hub
+        # tolerates reordering (terminal state wins, seq/duplicate guards) and the topic is not ordering-enabled.
         if [[ -n "$TOPIC" && "$QF_RUN_ID" != adhoc-* ]]; then
-          gcloud pubsub topics publish "$TOPIC" --message="$EVT" --ordering-key="$QF_RUN_ID"  >/dev/null && echo "event $TYPE published" || echo "::warning::event publish failed (orchestrator will reconcile via GitHub API)"
+          if ERR=$(gcloud pubsub topics publish "$TOPIC" --message="$EVT" 2>&1 >/dev/null); then
+            echo "event $TYPE published"
+          else
+            echo "::warning::event $TYPE publish failed (orchestrator will reconcile via GitHub API): ${ERR:0:300}"
+          fi
         fi
         echo "$EVT" | jq . >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
