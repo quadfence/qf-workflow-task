@@ -185,6 +185,8 @@ runs:
       env:
         PRECHECK: ${{ inputs.precheck }}
         PARAMS_JSON: ${{ inputs.params_json }}
+        QF_PARAMS_JSON: ${{ inputs.params_json }}   # same name the command/outputs steps see
+        GH_TOKEN: ${{ github.token }}
         FP_PARAMS: ${{ inputs.fingerprint_params }}
       run: |
         set -euo pipefail

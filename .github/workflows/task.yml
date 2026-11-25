@@ -95,6 +95,7 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
         env:
           QF_PARAMS_JSON: ${{ inputs.params_json }}
+          GH_TOKEN: ${{ github.token }}      # the caller's GITHUB_TOKEN (permissions = the caller's `permissions:` block)
         run: ${{ inputs.command }}
 
       - id: outs
@@ -103,6 +104,7 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
         env:
           QF_PARAMS_JSON: ${{ inputs.params_json }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           OUT=$(bash -c '${{ inputs.outputs_command }}' 2>/dev/null || echo '{}')
