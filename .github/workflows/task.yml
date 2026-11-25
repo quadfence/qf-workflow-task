@@ -41,6 +41,11 @@ on:
 permissions:
   contents: read
   id-token: write   # needed only for the WIF path on GitHub-hosted runners
+  # A called workflow can only keep or reduce the caller's token permissions, never raise them, so this is a ceiling:
+  # the GH_TOKEN the command step gets has actions: write only when the CALLER's job grants it (a wf-* wrapper whose
+  # command starts its repository's inner workflow). Without this line the token loses actions: write here and the
+  # dispatch is refused (HTTP 403) even though the caller granted it.
+  actions: write
 
 jobs:
   task:
